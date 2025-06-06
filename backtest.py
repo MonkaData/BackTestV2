@@ -1,8 +1,10 @@
-import ccxt
+import io
+import zipfile
+import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Dict, Any
 
 @dataclass
@@ -21,21 +23,64 @@ class BacktestResult:
     fees_total: float
 
 
-def fetch_ohlcv(symbol: str, timeframe: str, since: int, limit: int = 1000) -> pd.DataFrame:
-    exchange = ccxt.binance()
-    all_candles = []
-    while True:
-        candles = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
-        if not candles:
-            break
-        all_candles += candles
-        since = candles[-1][0] + 1
-        if len(candles) < limit:
-            break
-    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    return df
+def download_binance_klines(symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame:
+    """Download historical klines from data.binance.vision.
+
+    Parameters
+    ----------
+    symbol : str
+        Trading pair, e.g. ``'BTCUSDT'``.
+    timeframe : str
+        Interval such as ``'30m'``.
+    start : str
+        Start date in ``YYYY-MM`` or ``YYYY-MM-DD`` format.
+    end : str
+        End date in ``YYYY-MM`` or ``YYYY-MM-DD`` format.
+    """
+    start_p = pd.Period(start, freq="M")
+    end_p = pd.Period(end, freq="M")
+    months = pd.period_range(start_p, end_p, freq="M")
+
+    frames = []
+    for p in months:
+        url = (
+            f"https://data.binance.vision/data/spot/monthly/klines/{symbol}/{timeframe}/"
+            f"{symbol}-{timeframe}-{p.year}-{p.month:02d}.zip"
+        )
+        r = requests.get(url)
+        if r.status_code != 200:
+            print(f"Warning: failed to download {url} ({r.status_code})")
+            continue
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            name = z.namelist()[0]
+            with z.open(name) as f:
+                df_month = pd.read_csv(
+                    f,
+                    header=None,
+                    names=[
+                        "open_time",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                        "close_time",
+                        "quote_volume",
+                        "trades",
+                        "taker_buy_base",
+                        "taker_buy_quote",
+                        "ignore",
+                    ],
+                )
+        frames.append(df_month)
+
+    if not frames:
+        raise RuntimeError("No data downloaded")
+
+    df = pd.concat(frames, ignore_index=True)
+    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    return df[["open", "high", "low", "close", "volume"]]
 
 
 def SMA(series: pd.Series, length: int) -> pd.Series:
@@ -66,7 +111,7 @@ def run_backtest(df: pd.DataFrame, params: Dict[str, Any]) -> BacktestResult:
         now_ts = df.index[i]
         ma = df['ma'].iloc[i]
         atr = df['atr'].iloc[i]
-        symbol = 'BTC/USDT'
+        symbol = 'BTCUSDT'
 
         if symbol in last_loss_time and now_ts < last_loss_time[symbol] + pd.Timedelta(hours=params['cooldown_h']):
             equity_curve.append(equity)
@@ -82,9 +127,9 @@ def run_backtest(df: pd.DataFrame, params: Dict[str, Any]) -> BacktestResult:
             if (price <= pos.stop_loss or price >= pos.take_profit or price <= pos.trailing_stop):
                 exec_price = price
                 profit = (exec_price - pos.entry_price) * pos.qty
-                capital += profit
                 fees = abs(exec_price * pos.qty) * 0.001
                 fees_paid_total += fees
+                capital += profit - fees
                 del portfolio[symbol]
                 if profit < 0:
                     last_loss_time[symbol] = now_ts
@@ -99,7 +144,7 @@ def run_backtest(df: pd.DataFrame, params: Dict[str, Any]) -> BacktestResult:
                 entry = price
                 fees = entry * qty * 0.001
                 fees_paid_total += fees
-                capital -= entry * qty + fees
+                capital -= fees
                 portfolio[symbol] = Trade(
                     entry_price=entry,
                     qty=qty,
@@ -155,11 +200,12 @@ def plot_result(result: BacktestResult, filename: str):
 
 
 def main():
-    start_date = '2021-01-01'
+    start_date = '2024-01-01'
+    end_date = '2024-06-30'
     timeframe = '30m'
-    symbol = 'BTC/USDT'
-    since = int(pd.Timestamp(start_date).timestamp() * 1000)
-    df = fetch_ohlcv(symbol, timeframe, since)
+    symbol = 'BTCUSDT'
+
+    df = download_binance_klines(symbol, timeframe, start_date, end_date)
     param_grid = {
         'capital_init': [100.0],
         'risk_trade': [0.05, 0.08],
